@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed to push seen.json
+  contents: write  # needed to push seen.json
 
 jobs:
   run:
@@ -22,20 +22,38 @@ jobs:
       - name: Install deps
         run: pip install requests beautifulsoup4 lxml
 
+      # ---- REDACTED sanity print so we know secrets are wired ----
+      - name: Sanity check env (redacted)
+        env:
+          TWILIO_SID:     ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN:   ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM:    ${{ secrets.TWILIO_FROM }}
+          SMS_TO_LIST:    ${{ secrets.SMS_TO_LIST }}
+          SMTP_HOST:      ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:      ${{ secrets.SMTP_PORT }}
+          SMTP_USER:      ${{ secrets.SMTP_USER }}
+          SMTP_PASS:      ${{ secrets.SMTP_PASS }}
+          EMAIL_TO_LIST:  ${{ secrets.EMAIL_TO_LIST }}
+        run: |
+          echo "TWILIO_SID set?        $([ -n "$TWILIO_SID" ] && echo yes || echo no)"
+          echo "TWILIO_TOKEN set?      $([ -n "$TWILIO_TOKEN" ] && echo yes || echo no)"
+          echo "TWILIO_FROM set?       $([ -n "$TWILIO_FROM" ] && echo yes || echo no)"
+          echo "SMS_TO_LIST length:    $(echo -n "$SMS_TO_LIST" | wc -c)"
+          echo "SMTP_HOST set?         $([ -n "$SMTP_HOST" ] && echo yes || echo no)"
+          echo "SMTP_USER set?         $([ -n "$SMTP_USER" ] && echo yes || echo no)"
+          echo "EMAIL_TO_LIST length:  $(echo -n "$EMAIL_TO_LIST" | wc -c)"
+
       - name: Run watcher
         env:
-          # SMS / Twilio
-          TWILIO_SID: ${{ secrets.TWILIO_SID }}
-          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
-          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
-          SMS_TO_LIST: ${{ secrets.SMS_TO_LIST }}
-
-          # Email / SMTP
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          EMAIL_TO_LIST: ${{ secrets.EMAIL_TO_LIST }}
+          TWILIO_SID:     ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN:   ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM:    ${{ secrets.TWILIO_FROM }}
+          SMS_TO_LIST:    ${{ secrets.SMS_TO_LIST }}
+          SMTP_HOST:      ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:      ${{ secrets.SMTP_PORT }}
+          SMTP_USER:      ${{ secrets.SMTP_USER }}
+          SMTP_PASS:      ${{ secrets.SMTP_PASS }}
+          EMAIL_TO_LIST:  ${{ secrets.EMAIL_TO_LIST }}
         run: python intern-bot/watcher.py
 
       - name: Persist seen.json
