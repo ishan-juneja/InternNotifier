@@ -1,15 +1,22 @@
 # == Intern Bot ==
-# Monitors Intern List (SWE, Data Analysis, ML/AI, PM) and the SimplifyJobs Summer 2026 GitHub list.
-# Runs on a GitHub Actions cron (every 15 minutes) and sends SMS via Twilio to multiple recipients.
+# Monitors Intern List search tabs (SWE, Data Analysis, ML/AI, PM) + SimplifyJobs Summer 2026 list.
+# Runs on GitHub Actions (every 15 minutes) and sends SMS via Twilio to multiple recipients.
 # Dedupe by (company|title|url) persisted in seen.json.
 
 import os, re, json, time, hashlib, requests, sys
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from bs4 import BeautifulSoup
 
 # ------------ Config & constants ------------
 IL_BASE = "https://www.intern-list.com"
-GITHUB_RAW_2026 = "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/main/README.md"
+IL_TABS: List[Tuple[str, str]] = [
+    ("Software Engineering", f"{IL_BASE}/?k=swe"),
+    ("Data Analysis",        f"{IL_BASE}/?k=da"),
+    ("Machine Learning & AI",f"{IL_BASE}/?k=aiml"),
+    ("Product Management",   f"{IL_BASE}/?k=pm"),
+]
+
+GITHUB_2026_RAW = "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/README.md"
 
 REQUEST_TIMEOUT = 45
 RETRIES = 2
@@ -117,82 +124,80 @@ def infer_category(title: str, default: str = "Software Engineering") -> str:
         return "Software Engineering"
     return default
 
-# ------------ Intern-List (4 categories) ------------
-def _extract_links_by_prefix(html: str, path_prefix: str, category: str) -> List[Dict]:
+# ------------ Intern-List search tab scraper ------------
+def _absolute(url: str) -> str:
+    if not url: return ""
+    if url.startswith("http://") or url.startswith("https://"): return url
+    if url.startswith("/"): return IL_BASE + url
+    return IL_BASE + "/" + url
+
+def _extract_cards_from_search(html: str, category: str) -> List[Dict]:
+    """
+    The search pages render lists of relevant posts. We collect anchor links that look like postings.
+    Heuristics:
+      - Prefer links under result sections/cards
+      - Skip obvious nav/footer/social links
+      - Title = anchor text; company inferred from nearby text
+    """
     soup = BeautifulSoup(html, "lxml")
-    items = []
-    # listing/detail links that live under the category path
-    for a in soup.select(f"a[href^='/{path_prefix}/']"):
-        title = a.get_text(strip=True)
-        href = a.get("href", "")
-        if not title or not href:
+    items: List[Dict] = []
+
+    # Strategy A: obvious result anchors with internal detail paths (/...-intern-...)
+    for a in soup.select("a[href]"):
+        href = a.get("href","")
+        text = a.get_text(strip=True)
+        if not href or not text: 
             continue
-        url = IL_BASE + href if href.startswith("/") else href
-        # attempt nearby company extraction
-        company = ""
-        parent = a.find_parent()
-        if parent:
-            txt = parent.get_text(" ", strip=True)
-            m = re.search(r"\b(?:at|@)\s+([A-Za-z0-9.&' -]{2,})", txt)
-            if m: company = m.group(1)
-        items.append(normalize_item("Intern List", category, title, url, company))
+        # Exclude nav/footer/tracking links
+        lower = href.lower()
+        if any(x in lower for x in ["#","/privacy","/terms","mailto:", "javascript:","/sitemap"]):
+            continue
+        # Likely posting if internal and not a top-level page
+        is_internal = lower.startswith("/") and not lower in ["/", "/?k=swe","/?k=da","/?k=aiml","/?k=pm"]
+        looks_like_post = ("intern" in text.lower()) or ("intern" in lower)
+        if is_internal and looks_like_post:
+            url = _absolute(href)
+            # infer company from the parent card's text
+            company = ""
+            parent = a.find_parent()
+            if parent:
+                txt = parent.get_text(" ", strip=True)
+                m = re.search(r"\b(?:at|@)\s+([A-Za-z0-9.&' -]{2,})", txt)
+                if m: company = m.group(1)
+            items.append(normalize_item("Intern List", category, text, url, company))
+
+    # Strategy B: if nothing found yet, also capture external application links on the page
+    if not items:
+        for a in soup.select("a[href^='http']"):
+            href = a.get("href","")
+            text = a.get_text(strip=True)
+            if not href or not text: 
+                continue
+            if "intern" not in (text.lower() + " " + href.lower()):
+                continue
+            # Avoid self-links to the search page itself
+            if href.startswith(IL_BASE) and href.endswith(("/?k=swe","/?k=da","/?k=aiml","/?k=pm")):
+                continue
+            items.append(normalize_item("Intern List", category, text, href))
+
+    # De-dupe by URL within this page
+    uniq = {}
+    for it in items:
+        uniq[it["url"]] = it
+    return list(uniq.values())
+
+def parse_intern_list_tab(category: str, url: str) -> List[Dict]:
+    html = fetch(url)
+    items = _extract_cards_from_search(html, category)
     return items
-
-def parse_intern_list_swe():
-    html = fetch(f"{IL_BASE}/swe-intern-list")
-    return _extract_links_by_prefix(html, "swe-intern-list", "Software Engineering")
-
-def parse_intern_list_da():
-    html = fetch(f"{IL_BASE}/da-intern-list")
-    return _extract_links_by_prefix(html, "da-intern-list", "Data Analysis")
-
-def _discover_ml_slug() -> Optional[str]:
-    """Discover ML/AI category path dynamically from the homepage/nav."""
-    try:
-        html = fetch(IL_BASE + "/")
-        soup = BeautifulSoup(html, "lxml")
-        for a in soup.find_all("a", href=True):
-            txt = a.get_text(" ", strip=True).lower()
-            href = a["href"]
-            if any(k in txt for k in ["machine learning", "ml", "ai"]) and href.startswith("/"):
-                return href.strip("/").rstrip("/")
-    except Exception as e:
-        log("WARN _discover_ml_slug:", e)
-    return None
-
-def parse_intern_list_ml():
-    slug = _discover_ml_slug()
-    candidates = [slug] if slug else []
-    # Backward-compatible fallbacks
-    candidates += [
-        "data-science-internships", "ml-intern-list", "ai-intern-list",
-        "machine-learning-internships", "data-science-intern-list"
-    ]
-    tried = set()
-    for s in candidates:
-        if not s or s in tried: 
-            continue
-        tried.add(s)
-        try:
-            html = fetch(f"{IL_BASE}/{s}")
-            return _extract_links_by_prefix(html, s, "Machine Learning & AI")
-        except Exception as e:
-            log(f"WARN ML/AI slug {s} failed:", e)
-    log("ERROR Intern List ML/AI: no working slug found")
-    return []
-
-def parse_intern_list_pm():
-    html = fetch(f"{IL_BASE}/pm-intern-list")
-    return _extract_links_by_prefix(html, "pm-intern-list", "Product Management")
 
 # ------------ SimplifyJobs / Summer 2026 GitHub list ------------
 def parse_simplify_2026():
     """
-    Parses the Summer2026-Internships README Markdown table.
-    Columns are usually: Company | Role | Location | Application/Link | (sometimes Date/Notes)
-    We extract company, role (title), location, link, and date if present.
+    Parses the Summer 2026 internships list (successor to PittCSC) from GitHub (dev branch).
+    Columns: Company | Role | Location | Application/Link | (optional Date/Notes)
     """
-    md = fetch(GITHUB_RAW_2026, headers={"Accept": "text/plain"})
+    md = fetch(GITHUB_2026_RAW, headers={"Accept": "text/plain"})
     items = []
     for line in md.splitlines():
         line = line.rstrip()
@@ -201,34 +206,22 @@ def parse_simplify_2026():
         cols = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cols) < 4:
             continue
-        # Skip header separator rows
-        if cols[0].lower() in ("company", "---", "—"):
+        if cols[0].lower() in ("company","---","—"):
             continue
 
-        # Company / Role: strip markdown links
-        company = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", cols[0])
-        title   = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", cols[1])
+        company  = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", cols[0])
+        title    = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", cols[1])
         location = cols[2]
-
-        # Link column may contain one or more markdown links; take the first URL
-        url = ""
         m = re.search(r"\((https?://[^\)]+)\)", cols[3])
-        if m:
-            url = m.group(1)
+        url = m.group(1) if m else ""
 
-        # Optional date column (some rows have it as 4th or 5th col)
-        posted = None
-        if len(cols) >= 5:
-            # free-form; keep as-is if it looks like a date or relative text
-            maybe = cols[4]
-            if maybe and maybe.lower() not in ("notes",):
-                posted = maybe
+        posted = cols[4] if len(cols) >= 5 and cols[4] and cols[4].lower() != "notes" else None
 
         if url:
             items.append(
                 normalize_item(
                     "SimplifyJobs 2026",
-                    infer_category(title),  # infer to route SW/DA/ML/PM
+                    infer_category(title),
                     title,
                     url,
                     company,
@@ -238,59 +231,28 @@ def parse_simplify_2026():
             )
     return items
 
-# ------------ Optional: Simplify site (best-effort; may block) ------------
-def parse_simplify_site():
-    """Scrape simplify.jobs/internships best-effort; safe to disable if noisy."""
-    try:
-        html = fetch("https://simplify.jobs/internships", headers={
-            "Referer": "https://simplify.jobs/",
-            "User-Agent": PRIMARY_UA,
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-    except Exception as e:
-        log("ERROR Simplify site fetch:", e)
-        return []
-    soup = BeautifulSoup(html, "lxml")
-    items = []
-    for a in soup.select("a[href*='/jobs/']"):
-        title = a.get_text(strip=True)
-        href = a.get("href","")
-        if not title or not href:
-            continue
-        url = "https://simplify.jobs" + href if href.startswith("/") else href
-        company = ""
-        parent = a.find_parent()
-        if parent:
-            txt = parent.get_text(" ", strip=True)
-            m = re.search(r"^([A-Za-z0-9.&' -]{2,})\s+[•–-]\s+", txt)
-            if m: company = m.group(1)
-        items.append(normalize_item("Simplify", infer_category(title), title, url, company))
-    return items
-
 # ------------ main ------------
 def main():
     log("START run")
     seen = load_seen()
     all_items: List[Dict] = []
 
-    # Each parser isolated with error logging; one failing won’t stop others
-    parsers = [
-        ("Intern List — SWE", parse_intern_list_swe),
-        ("Intern List — Data Analysis", parse_intern_list_da),
-        ("Intern List — ML/AI", parse_intern_list_ml),
-        ("Intern List — Product Management", parse_intern_list_pm),
-        ("SimplifyJobs 2026 GitHub", parse_simplify_2026),
-        # Optionally include the Simplify site (can 403 sometimes)
-        # ("Simplify site", parse_simplify_site),
-    ]
-
-    for name, fn in parsers:
+    # Intern-List tabs (your requested sources)
+    for cat, url in IL_TABS:
         try:
-            items = fn()
-            log(f"INFO parsed {name}: {len(items)} items")
+            items = parse_intern_list_tab(cat, url)
+            log(f"INFO parsed Intern List — {cat}: {len(items)} items")
             all_items += items
         except Exception as e:
-            log(f"ERROR parser {name}:", e)
+            log(f"ERROR parser Intern List — {cat}:", e)
+
+    # SimplifyJobs 2026 GitHub list
+    try:
+        sj = parse_simplify_2026()
+        log(f"INFO parsed SimplifyJobs 2026 GitHub: {len(sj)} items")
+        all_items += sj
+    except Exception as e:
+        log("ERROR parser SimplifyJobs 2026 GitHub:", e)
 
     # De-dupe and find new
     new = []
