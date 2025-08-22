@@ -12,6 +12,18 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
+    # Make env available to ALL steps; prefer secrets, fall back to variables.
+    env:
+      TWILIO_SID:     ${{ secrets.TWILIO_SID     || vars.TWILIO_SID     }}
+      TWILIO_TOKEN:   ${{ secrets.TWILIO_TOKEN   || vars.TWILIO_TOKEN   }}
+      TWILIO_FROM:    ${{ secrets.TWILIO_FROM    || vars.TWILIO_FROM    }}
+      SMS_TO_LIST:    ${{ secrets.SMS_TO_LIST    || vars.SMS_TO_LIST    }}
+      SMTP_HOST:      ${{ secrets.SMTP_HOST      || vars.SMTP_HOST      }}
+      SMTP_PORT:      ${{ secrets.SMTP_PORT      || vars.SMTP_PORT      }}
+      SMTP_USER:      ${{ secrets.SMTP_USER      || vars.SMTP_USER      }}
+      SMTP_PASS:      ${{ secrets.SMTP_PASS      || vars.SMTP_PASS      }}
+      EMAIL_TO_LIST:  ${{ secrets.EMAIL_TO_LIST  || vars.EMAIL_TO_LIST  }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -22,18 +34,7 @@ jobs:
       - name: Install deps
         run: pip install requests beautifulsoup4 lxml
 
-      # ---- REDACTED sanity print so we know secrets are wired ----
       - name: Sanity check env (redacted)
-        env:
-          TWILIO_SID:     ${{ secrets.TWILIO_SID }}
-          TWILIO_TOKEN:   ${{ secrets.TWILIO_TOKEN }}
-          TWILIO_FROM:    ${{ secrets.TWILIO_FROM }}
-          SMS_TO_LIST:    ${{ secrets.SMS_TO_LIST }}
-          SMTP_HOST:      ${{ secrets.SMTP_HOST }}
-          SMTP_PORT:      ${{ secrets.SMTP_PORT }}
-          SMTP_USER:      ${{ secrets.SMTP_USER }}
-          SMTP_PASS:      ${{ secrets.SMTP_PASS }}
-          EMAIL_TO_LIST:  ${{ secrets.EMAIL_TO_LIST }}
         run: |
           echo "TWILIO_SID set?        $([ -n "$TWILIO_SID" ] && echo yes || echo no)"
           echo "TWILIO_TOKEN set?      $([ -n "$TWILIO_TOKEN" ] && echo yes || echo no)"
@@ -44,16 +45,6 @@ jobs:
           echo "EMAIL_TO_LIST length:  $(echo -n "$EMAIL_TO_LIST" | wc -c)"
 
       - name: Run watcher
-        env:
-          TWILIO_SID:     ${{ secrets.TWILIO_SID }}
-          TWILIO_TOKEN:   ${{ secrets.TWILIO_TOKEN }}
-          TWILIO_FROM:    ${{ secrets.TWILIO_FROM }}
-          SMS_TO_LIST:    ${{ secrets.SMS_TO_LIST }}
-          SMTP_HOST:      ${{ secrets.SMTP_HOST }}
-          SMTP_PORT:      ${{ secrets.SMTP_PORT }}
-          SMTP_USER:      ${{ secrets.SMTP_USER }}
-          SMTP_PASS:      ${{ secrets.SMTP_PASS }}
-          EMAIL_TO_LIST:  ${{ secrets.EMAIL_TO_LIST }}
         run: python intern-bot/watcher.py
 
       - name: Persist seen.json
