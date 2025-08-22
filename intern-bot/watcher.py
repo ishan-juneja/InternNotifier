@@ -99,15 +99,47 @@ def twilio_send(body: str):
     if not all([sid, tok, frm]) or not to_list:
         log("INFO Twilio not configured or no recipients; skipping SMS")
         return
+
+    api_base = f"https://api.twilio.com/2010-04-01/Accounts/{sid}"
     for to in to_list:
         try:
-            r = requests.post(
-                f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
-                auth=(sid, tok),
-                data={"From": frm, "To": to, "Body": body[:1500]},
-                timeout=REQUEST_TIMEOUT,
-            )
-            log("INFO Twilio send", to, r.status_code)
+            data = {"To": to, "Body": body[:1500]}
+            # Support Messaging Service SIDs (start with "MG")
+            if frm.startswith("MG"):
+                data["MessagingServiceSid"] = frm
+            else:
+                data["From"] = frm
+
+            r = requests.post(f"{api_base}/Messages.json",
+                              auth=(sid, tok), data=data, timeout=REQUEST_TIMEOUT)
+            status = r.status_code
+            j = {}
+            try:
+                j = r.json()
+            except Exception:
+                pass
+
+            msg_sid = j.get("sid")
+            err = j.get("error_code")
+            log("INFO Twilio send", to, status, "sid:", msg_sid, "err:", err)
+
+            # If created, poll once or twice for delivery result and log details
+            if status == 201 and msg_sid:
+                # short sleep to let Twilio update status
+                time.sleep(2.0)
+                try:
+                    g = requests.get(f"{api_base}/Messages/{msg_sid}.json",
+                                     auth=(sid, tok), timeout=20)
+                    gj = g.json()
+                    log("INFO Twilio status",
+                        "to:", to,
+                        "sid:", msg_sid,
+                        "status:", gj.get("status"),
+                        "err_code:", gj.get("error_code"),
+                        "err_msg:", gj.get("error_message"))
+                except Exception as e:
+                    log("WARN Twilio status poll failed:", e)
+
         except Exception as e:
             log("ERROR Twilio send", to, e)
 
