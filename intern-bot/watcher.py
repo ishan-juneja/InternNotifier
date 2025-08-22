@@ -1,10 +1,11 @@
 # == Intern Bot ==
-# Monitors Intern-List search tabs (SWE, Data Analysis, ML/AI, PM) + SimplifyJobs Summer 2026 README (Age=0d).
+# Monitors Intern List search tabs (SWE, Data Analysis, ML/AI, PM) + SimplifyJobs Summer 2026 sections (Age=0d).
 # Runs on GitHub Actions (every 15 minutes). Sends SMS (Twilio) + Email (SMTP).
-# Dedupe by (company|title|url). Also: one-time "no new internships" ping per dry spell.
+# Dedupe by (company|title|url) persisted in seen.json.
+# One-time "No new internships found" notification persisted in state.json.
 
 import os, re, json, time, hashlib, requests, sys, smtplib
-from typing import List, Dict, Optional, Tuple, Union
+from typing import List, Dict, Optional, Tuple
 from email.mime.text import MIMEText
 from bs4 import BeautifulSoup
 
@@ -17,12 +18,12 @@ IL_TABS: List[Tuple[str, str]] = [
     ("Product Management",   f"{IL_BASE}/?k=pm"),
 ]
 
-# SimplifyJobs (PittCSC successor) — we’ll probe owners+branches and use raw/plain fallback
+# SimplifyJobs Summer 2026 README (GitHub HTML) locations to try
 GITHUB_OWNERS   = ["SimplifyJobs", "pittcsc"]
 GITHUB_REPOS    = ["Summer2026-Internships"]
 GITHUB_BRANCHES = ["dev", "main", "master"]
 
-# Headings inside README (emoji/punctuation ignored; case-insensitive)
+# Section names (normalized, emoji/format-insensitive)
 SIMPLIFY_SECTIONS = {
     "Product Management":      "product management internship roles",
     "Software Engineering":    "software engineering internship roles",
@@ -42,77 +43,52 @@ BASE_HEADERS = {
     "Referer": "https://www.google.com/",
 }
 
-# Store state next to this script
-SEEN_PATH = os.path.join(os.path.dirname(__file__), "seen.json")
+# Files (stored next to this script)
+HERE = os.path.dirname(__file__)
+SEEN_PATH  = os.path.join(HERE, "seen.json")
+STATE_PATH = os.path.join(HERE, "state.json")  # {"no_new_notified": bool}
 
-# Feature flags via envs
-TEST_NOTIFY = os.getenv("TEST_NOTIFY") == "1"  # Force a “new item” to test notifications
+# Feature flag to force a test notification (set TEST_NOTIFY=1 in workflow_dispatch)
+TEST_NOTIFY = os.getenv("TEST_NOTIFY") == "1"
 
 # ------------ Logging ------------
 def log(*args):
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
     print(f"[{ts} UTC]", *args, flush=True)
 
-# ------------ HTTP with retries ------------
-def fetch(url: str, headers: Optional[Dict] = None) -> str:
-    """GET with retries; rotates UA on last try; raises on failure."""
-    last_err = None
-    h = dict(BASE_HEADERS)
-    if headers: h.update(headers)
-    for attempt in range(RETRIES + 1):
-        try:
-            if attempt == RETRIES:
-                h["User-Agent"] = SECONDARY_UA
-                h["Referer"] = "https://www.bing.com/"
-            r = requests.get(url, headers=h, timeout=REQUEST_TIMEOUT)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            last_err = e
-            log(f"WARN fetch attempt {attempt+1}/{RETRIES+1} failed for {url}:", e)
-            time.sleep(BACKOFF_SECS)
-    raise RuntimeError(f"Failed to fetch {url}: {last_err}")
-
-# ------------ State (seen + dry-spell ping) ------------
-def _init_state() -> Dict[str, Union[List[str], bool]]:
-    """
-    State format (new):
-      {
-        "seen": [ "<sha1>", ... ],
-        "no_new_notified": false
-      }
-    Backwards compatible with old list-only format.
-    """
-    if not os.path.exists(SEEN_PATH):
-        return {"seen": [], "no_new_notified": False}
+# ------------ State (seen + state) ------------
+def load_seen():
     try:
-        data = json.load(open(SEEN_PATH))
-        # old format: list
-        if isinstance(data, list):
-            return {"seen": data, "no_new_notified": False}
-        # new format
-        if isinstance(data, dict):
-            data.setdefault("seen", [])
-            data.setdefault("no_new_notified", False)
-            return data
+        if os.path.exists(SEEN_PATH):
+            return set(json.load(open(SEEN_PATH)))
     except Exception as e:
         log("WARN load_seen:", e)
-    return {"seen": [], "no_new_notified": False}
+    return set()
 
-def load_seen_set_and_flag():
-    state = _init_state()
-    return set(state["seen"]), bool(state.get("no_new_notified", False)), state
-
-def save_state(seen_set: set, no_new_notified: bool):
-    state = {"seen": sorted(list(seen_set)), "no_new_notified": bool(no_new_notified)}
+def save_seen(seen):
     try:
         with open(SEEN_PATH, "w") as f:
-            json.dump(state, f)
+            json.dump(sorted(list(seen)), f)
     except Exception as e:
         log("WARN save_seen:", e)
 
+def load_state():
+    try:
+        if os.path.exists(STATE_PATH):
+            return json.load(open(STATE_PATH))
+    except Exception as e:
+        log("WARN load_state:", e)
+    return {"no_new_notified": False}
+
+def save_state(state: Dict):
+    try:
+        with open(STATE_PATH, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        log("WARN save_state:", e)
+
 def sha(item: Dict) -> str:
-    # Strong dedupe; switch to URL-only by replacing key with item['url'] if you prefer
+    # Strong dedupe; switch to url-only by using key = item['url']
     key = f"{item.get('company','').strip()}|{item.get('title','').strip()}|{item.get('url','').strip()}"
     return hashlib.sha1(key.encode()).hexdigest()
 
@@ -169,6 +145,26 @@ def twilio_self_check():
     except Exception as e:
         log("ERROR Twilio auth probe failed:", e)
         return False
+
+# ------------ HTTP with retries ------------
+def fetch(url: str, headers: Optional[Dict] = None) -> str:
+    """GET with retries; rotates UA on last try; raises on failure."""
+    last_err = None
+    h = dict(BASE_HEADERS)
+    if headers: h.update(headers)
+    for attempt in range(RETRIES + 1):
+        try:
+            if attempt == RETRIES:
+                h["User-Agent"] = SECONDARY_UA
+                h["Referer"] = "https://www.bing.com/"
+            r = requests.get(url, headers=h, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last_err = e
+            log(f"WARN fetch attempt {attempt+1}/{RETRIES+1} failed for {url}:", e)
+            time.sleep(BACKOFF_SECS)
+    raise RuntimeError(f"Failed to fetch {url}: {last_err}")
 
 # ------------ Normalize & categorize ------------
 def normalize_item(source: str, category: str, title: str, url: str, company: str = "", location: str = "", meta: Dict = None) -> Dict:
@@ -253,165 +249,134 @@ def parse_intern_list_tab(category: str, url: str) -> List[Dict]:
     html = fetch(url)
     return _extract_cards_from_search(html, category)
 
-# ------------ SimplifyJobs / Summer 2026 README (Age=0d) ------------
-def _fetch_2026_readme() -> str:
-    """Fetch README text: try raw first, then ?plain=1; probe multiple owners/branches."""
-    # raw first
-    for owner in GITHUB_OWNERS:
-        for repo in GITHUB_REPOS:
-            for br in GITHUB_BRANCHES:
-                url = f"https://raw.githubusercontent.com/{owner}/{repo}/{br}/README.md"
-                try:
-                    md = fetch(url, headers={"Accept":"text/plain"})
-                    if md:
-                        log("INFO 2026 README (raw)", owner, repo, br, "len:", len(md))
-                        return md
-                except Exception as e:
-                    log("WARN 2026 raw miss:", url, e)
-    # ?plain=1 fallback
-    for owner in GITHUB_OWNERS:
-        for repo in GITHUB_REPOS:
-            for br in GITHUB_BRANCHES:
-                url = f"https://github.com/{owner}/{repo}/blob/{br}/README.md?plain=1"
-                try:
-                    md = fetch(url, headers={"Accept":"text/plain"})
-                    if md:
-                        log("INFO 2026 README (plain)", owner, repo, br, "len:", len(md))
-                        return md
-                except Exception as e:
-                    log("WARN 2026 plain miss:", url, e)
-    return ""
-
+# ------------ SimplifyJobs / Summer 2026 (sections via GitHub HTML, Age=0d) ------------
 def _norm(s: str) -> str:
-    """Lowercase, strip emojis/punctuation that often appear in headings."""
     s = (s or "").lower()
-    s = re.sub(r"[\u2600-\u27ff\U0001F000-\U0001FAFF]", "", s)  # emojis/symbols
-    s = re.sub(r"[^\w\s&/+-]", " ", s)  # keep word chars and a few symbols
+    s = re.sub(r"[\u2600-\u27ff\U0001F000-\U0001FAFF]", "", s)  # strip emojis/symbols
+    s = re.sub(r"[^\w\s&/+-]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
-def _iter_section_lines(md: str, section_phrase: str):
-    """
-    Yield lines within the README that belong to the heading whose normalized text
-    contains `section_phrase`. Stops when the next '## ' heading appears.
-    """
-    target = _norm(section_phrase)
-    lines = md.splitlines()
-    in_section = False
-    for i, line in enumerate(lines):
-        if line.startswith("#"):
-            if line.startswith("## "):
-                head_norm = _norm(line.lstrip("# ").strip())
-                if target in head_norm:
-                    in_section = True
-                    continue
-                elif in_section:
-                    break
-        if in_section:
-            yield line
+def _fetch_2026_html() -> str:
+    # Prefer GitHub HTML (not ?plain=1), try multiple owners/branches
+    for owner in GITHUB_OWNERS:
+        for repo in GITHUB_REPOS:
+            for br in GITHUB_BRANCHES:
+                url = f"https://github.com/{owner}/{repo}/blob/{br}/README.md"
+                try:
+                    html = fetch(url, headers={"Accept":"text/html"})
+                    if html:
+                        log("INFO 2026 README HTML", owner, repo, br, "len:", len(html))
+                        return html
+                except Exception as e:
+                    log("WARN 2026 HTML miss:", url, e)
+    return ""
 
-def _parse_markdown_table_lines(section_lines):
-    """From a stream of lines inside a section, extract markdown table rows as lists of columns."""
-    rows = []
-    for line in section_lines:
-        if not line.startswith("|"):
-            continue
-        # skip separators like |---|---|
-        if re.fullmatch(r"\|\s*[-:\s]+\|.*", line):
-            continue
-        cols = [c.strip() for c in line.strip().strip("|").split("|")]
-        rows.append((cols, line))
-    return rows
-
-def _md_link_text(md_cell: str) -> str:
-    return re.sub(r"\[(.*?)\]\(.*?\)", r"\1", md_cell or "")
-
-def _md_first_url(md_cell: str) -> str:
-    m = re.search(r"\((https?://[^\)]+)\)", md_cell or "")
-    return m.group(1) if m else ""
+def _normalize_heading_text(s: str) -> str:
+    return _norm(s)
 
 def parse_simplify_2026_age0() -> List[Dict]:
     """
-    Parse ONLY rows with Age '0d' from 3 Simplify README sections:
-      - Product Management Internship Roles
-      - Software Engineering Internship Roles
-      - Data Science, AI & Machine Learning Internship Roles
+    Parse only Age=0d rows from the three sections by reading GitHub's HTML and extracting tables.
     """
-    md = _fetch_2026_readme()
-    if not md:
-        log("ERROR Could not fetch 2026 README from GitHub")
+    html = _fetch_2026_html()
+    if not html:
+        log("ERROR Could not fetch 2026 README HTML from GitHub")
         return []
 
-    all_items = []
-    for category, section_name in SIMPLIFY_SECTIONS.items():
-        try:
-            section_lines = list(_iter_section_lines(md, section_name))
-            rows = _parse_markdown_table_lines(section_lines)
-            if not rows:
-                log(f"WARN Simplify 2026: no table rows found in section: {category}")
+    soup = BeautifulSoup(html, "lxml")
+    all_items: List[Dict] = []
+
+    # Find H2 headings, match by normalized text
+    h2s = soup.select("h2")
+    for category, section_phrase in SIMPLIFY_SECTIONS.items():
+        target = _normalize_heading_text(section_phrase)
+        section_table = None
+
+        # locate heading and the next table following it
+        for h in h2s:
+            head_txt = h.get_text(" ", strip=True)
+            if target in _normalize_heading_text(head_txt):
+                nxt = h.find_next(["table","h2"])
+                if nxt and nxt.name == "table":
+                    section_table = nxt
+                break
+
+        if section_table is None:
+            log(f"WARN Simplify 2026 HTML: no table found for section: {category}")
+            continue
+
+        rows = section_table.select("tr")
+        if not rows:
+            log(f"WARN Simplify 2026 HTML: empty table for section: {category}")
+            continue
+
+        def cell_text(td): return td.get_text(" ", strip=True) if td else ""
+        def cell_url(td):
+            a = td.select_one("a[href]")
+            return a["href"] if a and a.has_attr("href") else ""
+
+        # header & age column index
+        header_cells = rows[0].select("th,td")
+        age_idx = None
+        header_norm = [ _normalize_heading_text(cell_text(c)) for c in header_cells ]
+        for idx, hx in enumerate(header_norm):
+            if hx == "age":
+                age_idx = idx
+                break
+
+        # iterate data rows
+        data_rows = rows[1:] if header_cells else rows
+        for tr in data_rows:
+            tds = tr.select("td")
+            if len(tds) < 4:
                 continue
 
-            # detect Age column (if present)
-            age_idx = None
-            header = rows[0][0] if rows else []
-            if header and any(re.match(r"(?i)^age$", h) for h in header):
-                for idx, h in enumerate(header):
-                    if re.match(r"(?i)^age$", h):
-                        age_idx = idx
-                        break
+            texts = [cell_text(td) for td in tds]
+            urls  = [cell_url(td)  for td in tds]
 
-            for cols, _raw in rows:
-                # skip header row
-                if any(re.match(r"(?i)^company$", c) for c in cols):
-                    continue
-                if len(cols) < 4:
-                    continue
+            # require Age=0d
+            def has_0d():
+                if age_idx is not None and age_idx < len(texts):
+                    return _norm(texts[age_idx]) == "0d"
+                return any(" 0d" in _norm(x) or _norm(x) == "0d" for x in texts)
 
-                # '0d' filter
-                is_0d = False
-                if age_idx is not None and age_idx < len(cols):
-                    is_0d = (_norm(cols[age_idx]) == "0d")
-                else:
-                    is_0d = any(_norm(c) == "0d" or " 0d" in _norm(c) for c in cols)
+            if not has_0d():
+                continue
 
-                if not is_0d:
-                    continue
+            company  = texts[0]
+            title    = texts[1] if len(texts) > 1 else ""
+            location = texts[2] if len(texts) > 2 else ""
+            url      = urls[3]  if len(urls)  > 3 else cell_url(tds[3])
 
-                company  = _md_link_text(cols[0])
-                title    = _md_link_text(cols[1]) if len(cols) > 1 else ""
-                location = cols[2] if len(cols) > 2 else ""
-                url      = _md_first_url(cols[3]) if len(cols) > 3 else ""
+            # absolutize GitHub-relative links if any
+            if url and url.startswith("/"):
+                url = "https://github.com" + url
 
-                posted = None
-                for extra in cols[4:]:
-                    if "0d" in _norm(extra):
-                        posted = "0d"
-                        break
-
-                if url:
-                    all_items.append(
-                        normalize_item(
-                            "SimplifyJobs 2026",
-                            category,
-                            title,
-                            url,
-                            company,
-                            location,
-                            meta={"posted": posted} if posted else None,
-                        )
+            if url:
+                all_items.append(
+                    normalize_item(
+                        "SimplifyJobs 2026",
+                        category,
+                        title,
+                        url,
+                        company,
+                        location,
+                        meta={"posted": "0d"},
                     )
-        except Exception as e:
-            log(f"ERROR Simplify 2026 section parse ({category}):", e)
+                )
 
-    log(f"INFO Simplify 2026 age=0d total: {len(all_items)}")
+    log(f"INFO Simplify 2026 age=0d total (HTML): {len(all_items)}")
     return all_items
 
 # ------------ main ------------
 def main():
     log("START run")
-    log("INFO seen_path =", SEEN_PATH)
+    log("INFO seen_path =", SEEN_PATH, "state_path =", STATE_PATH)
     twilio_self_check()
-    seen_set, no_new_notified, _raw_state = load_seen_set_and_flag()
-    log("INFO seen size =", len(seen_set))
+    seen = load_seen()
+    state = load_state()
+    log("INFO seen size =", len(seen), "no_new_notified =", state.get("no_new_notified"))
+
     all_items: List[Dict] = []
 
     # Intern-List tabs
@@ -423,62 +388,62 @@ def main():
         except Exception as e:
             log(f"ERROR parser Intern List — {cat}:", e)
 
-    # SimplifyJobs 2026 (only Age=0d)
+    # SimplifyJobs 2026 (sections; Age=0d only)
     try:
         sj = parse_simplify_2026_age0()
-        log(f"INFO parsed SimplifyJobs 2026 GitHub (0d): {len(sj)} items")
+        log(f"INFO parsed SimplifyJobs 2026 GitHub (Age=0d): {len(sj)} items")
         all_items += sj
     except Exception as e:
         log("ERROR parser SimplifyJobs 2026 GitHub:", e)
 
-    # Optional: inject a test item to validate notifications
-    if TEST_NOTIFY:
-        all_items.append(normalize_item("Intern Bot", "Test", "Test Notification", "https://example.com", "DemoCo"))
-
-    # De-dupe vs seen
+    # De-dupe and find new
     new = []
     for it in all_items:
         key = sha(it)
-        if key not in seen_set:
-            seen_set.add(key)
+        if key not in seen:
+            seen.add(key)
             new.append(it)
 
-    if not new:
-        # one-time "no new internships" ping
-        if not no_new_notified:
-            body = "No new internships found right now. I’ll notify you as soon as new ones appear."
-            twilio_send(body)
-            email_send("Internship alerts — no new roles yet", body)
-            no_new_notified = True
-            save_state(seen_set, no_new_notified)
-            log("DONE sent one-time no-new notice")
-        else:
-            log("DONE no new items")
+    # TEST: force one synthetic item
+    if TEST_NOTIFY and not new:
+        new = [normalize_item("Intern Bot", "Test", "Test Notification", "https://example.com", "DemoCo")]
+
+    if new:
+        # reset "no new" flag; we found new items
+        state["no_new_notified"] = False
+
+        # Compose compact alert (cap to 10 lines)
+        batch = new[:10]
+        lines = [
+            "• [" + (i.get("category") or "?") + "] [" + (i.get("source") or "?") + "] "
+            + (i.get("company", "")[:40] or "Unknown Company") + " — " + (i.get("title", "")[:70] or "Role")
+            + ((" — " + i.get("location", "")) if i.get("location") else "")
+            + ((" — " + str(i.get("posted"))) if i.get("posted") else "")
+            + "\n" + i["url"]
+            for i in batch
+        ]
+        tail = "" if len(new) <= len(batch) else f"\n(+{len(new)-len(batch)} more new roles)"
+        body = "New internships:\n" + "\n".join(lines) + tail + "\nReply STOP to opt out."
+
+        twilio_send(body)
+        email_send("Internship alerts", body)
+
+        save_seen(seen)
+        save_state(state)
+        log(f"DONE notified {len(batch)} of {len(new)} new items; seen now {len(seen)}; no_new_notified={state['no_new_notified']}")
         return
 
-    # If we found new items, clear the dry-spell flag
-    no_new_notified = False
+    # No new items — send one-time heads-up if not already sent
+    if not state.get("no_new_notified"):
+        msg = "No new internships found in the last check. You'll only see this once until new roles appear."
+        twilio_send(msg)
+        email_send("Internship alerts — no new roles", msg)
+        state["no_new_notified"] = True
+        save_state(state)
+        log("DONE no new items (sent one-time no-new notice)")
+        return
 
-    # Compose compact alert (cap to 6 lines)
-    batch = new[:6]
-    lines = [
-        "• [" + (i.get("category") or "?") + "] [" + (i.get("source") or "?") + "] "
-        + (i.get("company", "")[:40] or "Unknown Company") + " — " + (i.get("title", "")[:70] or "Role")
-        + ((" — " + i.get("location", "")) if i.get("location") else "")
-        + ((" — " + str(i.get("posted"))) if i.get("posted") else "")
-        + "\n" + i["url"]
-        for i in batch
-    ]
-    tail = "" if len(new) <= 6 else f"\n(+{len(new)-6} more new roles)"
-    body = "New internships:\n" + "\n".join(lines) + tail + "\nReply STOP to opt out."
-
-    # Send
-    twilio_send(body)
-    email_send("Internship alerts — new roles", body)
-
-    # Persist state
-    save_state(seen_set, no_new_notified)
-    log(f"DONE notified {len(batch)} of {len(new)} new items; seen now {len(seen_set)}")
+    log("DONE no new items (no notice — already sent previously)")
 
 if __name__ == "__main__":
     try:
