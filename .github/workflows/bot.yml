@@ -4,9 +4,18 @@ on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
+    # inputs:
+    #   test_notify:
+    #     description: "Force a test notification (1=yes)"
+    #     required: false
+    #     default: "0"
 
 permissions:
-  contents: write  # needed to push seen.json
+  contents: write  # needed to push seen/state json
+
+concurrency:
+  group: intern-bot
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -23,9 +32,13 @@ jobs:
       SMTP_USER:      ${{ secrets.SMTP_USER      || vars.SMTP_USER      }}
       SMTP_PASS:      ${{ secrets.SMTP_PASS      || vars.SMTP_PASS      }}
       EMAIL_TO_LIST:  ${{ secrets.EMAIL_TO_LIST  || vars.EMAIL_TO_LIST  }}
+      #TEST_NOTIFY:     ${{ inputs.test_notify }}   # uncomment to allow manual “test” runs
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed to pull/rebase
+          persist-credentials: true
 
       - uses: actions/setup-python@v5
         with:
@@ -43,14 +56,42 @@ jobs:
           echo "SMTP_HOST set?         $([ -n "$SMTP_HOST" ] && echo yes || echo no)"
           echo "SMTP_USER set?         $([ -n "$SMTP_USER" ] && echo yes || echo no)"
           echo "EMAIL_TO_LIST length:  $(echo -n "$EMAIL_TO_LIST" | wc -c)"
+          echo "TEST_NOTIFY:           ${TEST_NOTIFY:-0}"
 
       - name: Run watcher
         run: python intern-bot/watcher.py
 
-      - name: Persist seen.json
+      - name: Persist seen/state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -e
           git config user.name "intern-bot"
           git config user.email "intern-bot@users.noreply.github.com"
-          git add intern-bot/seen.json || true
-          git commit -m "update seen.json" || true
-          git push || true
+
+          # Make sure we’re up-to-date with remote before committing
+          git fetch origin main
+          # Work on a temp branch to avoid locking main during rebase
+          git switch -C update-by-bot || git switch update-by-bot
+
+          # Reset to remote main to ensure clean base
+          git reset --hard origin/main
+
+          # Stage changes (either/both files may change)
+          git add intern-bot/seen.json intern-bot/state.json || true
+
+          # If nothing to commit, exit cleanly
+          git diff --cached --quiet && { echo "No changes to commit"; exit 0; }
+
+          git commit -m "update seen/state"
+
+          # Rebase on top of latest main in case another push landed
+          for i in 1 2 3; do
+            git fetch origin main
+            git rebase origin/main && break || { echo "Rebase attempt $i failed; retrying..."; git rebase --abort || true; sleep 2; }
+          done
+
+          # Push with retries to handle races
+          for i in 1 2 3; do
+            git push -u origin HEAD:main && break || { echo "Push attempt $i failed; pulling/rebasing and retrying..."; git pull --rebase origin main || true; sleep 2; }
+          done
